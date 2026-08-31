@@ -1,0 +1,391 @@
+theory ARAS2KA_Full_Protocol
+begin
+
+builtins: hashing, symmetric-encryption
+
+/* 1. System initialization. */
+rule Init:
+  [ Fr(~k) ] --[ Initialized() ]-> [ !Master(~k) ]
+
+/* 2. Vehicle registration over a secure channel. */
+rule V_Reg_Request:
+  [ Fr(~idi) ] --> [ SecureVReq(~idi) ]
+
+rule TA_Reg_V:
+  let tidi = senc(~rni,h(idi))
+      si   = h(<k,~rni>)
+      ai   = senc(si,tidi)
+  in
+  [ !Master(k), SecureVReq(idi), Fr(~rni) ]
+  --[ TARegisteredV(idi,tidi) ]->
+  [ TAVDB(idi,tidi,~rni)
+  , SecureVResp(idi,tidi,~rni,si,ai)
+  ]
+
+rule V_Reg_Store:
+  [ SecureVResp(idi,tidi,rni,si,ai) ]
+  --[ VRegistered(idi,tidi) ]->
+  [ VState(idi,tidi,rni,si,ai) ]
+
+/* 3. RSU registration over a secure channel. */
+rule R_Reg_Request:
+  [ Fr(~idj) ] --> [ SecureRReq(~idj) ]
+
+rule TA_Reg_R:
+  let tidj = senc(~rnj,h(idj))
+      sj   = h(<k,~rnj>)
+      aj   = senc(sj,tidj)
+  in
+  [ !Master(k), SecureRReq(idj), Fr(~rnj) ]
+  --[ TARegisteredR(idj,tidj) ]->
+  [ TARDB(idj,tidj,~rnj)
+  , SecureRResp(idj,tidj,~rnj,sj,aj)
+  ]
+
+rule R_Reg_Store:
+  [ SecureRResp(idj,tidj,rnj,sj,aj) ]
+  --[ RRegistered(idj,tidj) ]->
+  [ RState(idj,tidj,rnj,sj,aj) ]
+
+/* 4. RSU authentication/enrolment, paper Msg1--Msg2. */
+rule Enroll_R_Msg1:
+  let bj = h(<tidj,rnj>)
+      cj = senc(bj,tidj)
+      dj = h(<tidj,aj,cj,~t1>)
+  in
+  [ RState(idj,tidj,rnj,sj,aj), Fr(~t1) ]
+  --[ REnrollStart(idj,tidj) ]->
+  [ Out(<'enroll1',tidj,dj,~t1>)
+  , REnrollWait(idj,tidj,rnj,sj,aj)
+  ]
+
+rule Enroll_TA_Msg2:
+  let sj = h(<k,rnj>)
+      aj = senc(sj,tidj)
+      bj = h(<tidj,rnj>)
+      cj = senc(bj,tidj)
+      dj = h(<tidj,aj,cj,t1>)
+      ej = senc(rnj,sj)
+      fj = h(<tidj,sj,ej,~t2>)
+  in
+  [ !Master(k), TARDB(idj,tidj,rnj)
+  , In(<'enroll1',tidj,dj,t1>), Fr(~t2)
+  ]
+  --[ TAEnrollApprove(idj,tidj) ]->
+  [ TARDB(idj,tidj,rnj)
+  , Out(<'enroll2',ej,fj,~t2>)
+  ]
+
+rule Enroll_R_Complete:
+  let fj = h(<tidj,sj,ej,t2>)
+  in
+  [ REnrollWait(idj,tidj,rnj,sj,aj)
+  , In(<'enroll2',ej,fj,t2>)
+  ]
+  --[ REnrollComplete(idj,tidj) ]->
+  [ RReady(idj,tidj,rnj,sj,aj), Out(<'ready',tidj>) ]
+
+/* 5. Mutual authentication and session-key agreement, Msg3--Msg8. */
+rule MASKA1_V_Msg3:
+  let bi = h(<tidi,rni>)
+      ci = h(<tidi,ai,bi,~t3>)
+  in
+  [ VState(idi,tidi,rni,si,ai), In(<'ready',beacon>), Fr(~t3) ]
+  --[ VStartMASKA(idi,tidi) ]->
+  [ Out(<'msg3',tidi,ci,~t3>)
+  , VWait6(idi,tidi,rni,si,ai)
+  ]
+
+rule MASKA2_R_Msg4:
+  [ RReady(idj,tidj,rnj,sj,aj)
+  , In(<'msg3',tidi,ci,t3>), Fr(~t4)
+  ]
+  --[ RForward4(idj,tidj,tidi) ]->
+  [ Out(<'msg4',tidi,tidj,ci,t3,~t4>)
+  , RWait5(idj,tidj,rnj,sj,aj,tidi)
+  ]
+
+rule MASKA3_TA_Msg5:
+  let si = h(<k,rni>)
+      ai = senc(si,tidi)
+      bi = h(<tidi,rni>)
+      ci = h(<tidi,ai,bi,t3>)
+      sj = h(<k,rnj>)
+      di = senc(~rnip,tidi)
+      gj = senc(~rnjp,tidj)
+      sk = h(<~rnip,~rnjp>)
+  in
+  [ !Master(k), TAVDB(idi,tidi,rni), TARDB(idj,tidj,rnj)
+  , In(<'msg4',tidi,tidj,ci,t3,t4>)
+  , Fr(~rnip), Fr(~rnjp), Fr(~t5)
+  ]
+  --[ TAIssue(idi,idj,tidi,tidj,sk) ]->
+  [ Out(<'msg5',di,gj,~t5>)
+  , TAPending(idi,tidi,rni,si,idj,tidj,rnj,sj,
+              ~rnip,~rnjp,di,gj,sk)
+  ]
+
+rule MASKA4_R_Msg6:
+  let di  = senc(rnip,tidi)
+      gj  = senc(rnjp,tidj)
+      sk  = h(<rnip,rnjp>)
+      hij = h(<di,gj,sk,~t6>)
+  in
+  [ RWait5(idj,tidj,rnj,sj,aj,tidi)
+  , In(<'msg5',di,gj,t5>), Fr(~t6)
+  ]
+  --[ RSend6(idj,tidj,tidi,sk) ]->
+  [ Out(<'msg6',tidj,di,gj,aj,hij,~t6>)
+  , RWait7(idj,tidj,rnj,sj,aj,tidi,rnip,rnjp,di,gj,sk)
+  ]
+
+rule MASKA5_V_Msg7:
+  let di        = senc(rnip,tidi)
+      gj        = senc(rnjp,tidj)
+      sk        = h(<rnip,rnjp>)
+      hij       = h(<di,gj,sk,t6>)
+      tidi_plus = senc(rnip,h(idi))
+      /* Exact paper formula: A_i+ = S_i XOR RN_i+. */
+      ai_plus   = senc(si,rnip)
+      lij       = h(<sj_received,rnip,rnjp>)
+  in
+  [ VWait6(idi,tidi,rni,si,ai)
+  , In(<'msg6',tidj,di,gj,senc(sj_received,tidj),hij,t6>)
+  , Fr(~t7)
+  ]
+  --[ VAcceptR(idi,tidi,tidj,sk)
+    , VSend7(idi,tidi,tidj,sk)
+    , VUpdatedAfterMASKA(idi,tidi,tidi_plus)
+    ]->
+  [ VState(idi,tidi_plus,rnip,si,ai_plus)
+  , Out(<'msg7',lij,~t7>)
+  ]
+
+rule MASKA6_R_Msg8:
+  let lij        = h(<sj,rnip,rnjp>)
+      tidj_plus = senc(rnjp,h(idj))
+      aj_plus   = senc(sj,tidj_plus)
+  in
+  [ RWait7(idj,tidj,rnj,sj,aj,tidi,rnip,rnjp,di,gj,sk)
+  , In(<'msg7',lij,t7>), Fr(~t8)
+  ]
+  --[ RAcceptV(idj,tidj,tidi,sk)
+    , RSend8(idj,tidj,tidi,sk)
+    , RUpdatedAfterMASKA(idj,tidj,tidj_plus)
+    ]->
+  [ RReady(idj,tidj_plus,rnjp,sj,aj_plus)
+  , Out(<'msg8',sj,gj,~t8>)
+  ]
+
+rule MASKA7_TA_Complete:
+  let tidi_plus = senc(rnip,h(idi))
+      tidj_plus = senc(rnjp,h(idj))
+  in
+  [ TAPending(idi,tidi,rni,si,idj,tidj,rnj,sj,
+              rnip,rnjp,di,gj,sk)
+  , In(<'msg8',sj,gj,t8>)
+  ]
+  --[ TAComplete(idi,idj,tidi,tidi_plus,tidj,tidj_plus,sk) ]->
+  [ TAVDB(idi,tidi_plus,rnip), TARDB(idj,tidj_plus,rnjp) ]
+
+rule MASKA_TA_Abort:
+  [ TAPending(idi,tidi,rni,si,idj,tidj,rnj,sj,
+              rnip,rnjp,di,gj,sk) ]
+  --[ TAAbortMASKA(idi,idj) ]->
+  [ TAVDB(idi,tidi,rni), TARDB(idj,tidj,rnj) ]
+
+/* 6. Vehicle identity change, paper msg1--msg4. */
+rule VChange1:
+  let mi = senc(~idi2,rni)
+      ri = h(<idi,tidi,ai,si,~ts1>)
+  in
+  [ VState(idi,tidi,rni,si,ai), Fr(~idi2), Fr(~ts1) ]
+  --[ VChangeStart(idi,~idi2,tidi) ]->
+  [ Out(<'vchg1',tidi,mi,ri,~ts1>)
+  , VCWait2(idi,tidi,rni,si,ai,~idi2)
+  ]
+
+rule VChange2_TA:
+  let si    = h(<k,rni>)
+      ai    = senc(si,tidi)
+      ri    = h(<idi,tidi,ai,si,ts1>)
+      mi    = senc(idi2,rni)
+      tidi2 = senc(rni,h(idi2))
+      ai2   = senc(si,tidi2)
+      ni    = h(<tidi2,si,~ts2>)
+  in
+  [ !Master(k), TAVDB(idi,tidi,rni)
+  , In(<'vchg1',tidi,mi,ri,ts1>), Fr(~ts2)
+  ]
+  --[ TAChangeVPrepare(idi,idi2,tidi,tidi2) ]->
+  [ Out(<'vchg2',ni,~ts2>)
+  , TACVWait3(idi,tidi,rni,idi2,tidi2,si,ai2,~ts2)
+  ]
+
+rule VChange3_V:
+  let tidi2 = senc(rni,h(idi2))
+      ai2   = senc(si,tidi2)
+      ni    = h(<tidi2,si,ts2>)
+      acki  = h(<tidi2,ts2,~ts3>)
+  in
+  [ VCWait2(idi,tidi,rni,si,ai,idi2)
+  , In(<'vchg2',ni,ts2>), Fr(~ts3)
+  ]
+  --[ VChangeAck(idi,idi2,tidi,tidi2) ]->
+  [ Out(<'vchg3',acki,~ts3>)
+  , VCWait4(idi,tidi,rni,si,ai,idi2,tidi2,ai2,ts2)
+  ]
+
+rule VChange4_TA_Commit:
+  let acki = h(<tidi2,ts2,ts3>)
+      confi = h(<tidi2,si,~ts4>)
+  in
+  [ TACVWait3(idi,tidi,rni,idi2,tidi2,si,ai2,ts2)
+  , In(<'vchg3',acki,ts3>), Fr(~ts4)
+  ]
+  --[ TAChangeVCommit(idi,idi2,tidi,tidi2) ]->
+  [ TAVDB(idi2,tidi2,rni), Out(<'vchg4',confi,~ts4>) ]
+
+rule VChange5_V_Commit:
+  [ VCWait4(idi,tidi,rni,si,ai,idi2,tidi2,ai2,ts2)
+  , In(<'vchg4',h(<tidi2,si,ts4>),ts4>)
+  ]
+  --[ VChangeCommit(idi,idi2,tidi,tidi2) ]->
+  [ VState(idi2,tidi2,rni,si,ai2) ]
+
+rule VChange_V_Rollback:
+  [ VCWait4(idi,tidi,rni,si,ai,idi2,tidi2,ai2,ts2) ]
+  --[ VChangeRollback(idi,idi2,tidi,tidi2) ]->
+  [ VState(idi,tidi,rni,si,ai) ]
+
+rule VChange_TA_Rollback:
+  [ TACVWait3(idi,tidi,rni,idi2,tidi2,si,ai2,ts2) ]
+  --[ TAChangeVRollback(idi,idi2,tidi,tidi2) ]->
+  [ TAVDB(idi,tidi,rni) ]
+
+/* 7. RSU identity change, paper msg5--msg8. */
+rule RChange1:
+  let mj = senc(~idj2,rnj)
+      rj = h(<idj,tidj,aj,sj,~ts5>)
+  in
+  [ RReady(idj,tidj,rnj,sj,aj), Fr(~idj2), Fr(~ts5) ]
+  --[ RChangeStart(idj,~idj2,tidj)
+    , RChangeSentLongTermSecret(idj,sj)
+    ]->
+  [ Out(<'rchg5',tidj,sj,mj,rj,~ts5>)
+  , RCWait6(idj,tidj,rnj,sj,aj,~idj2)
+  ]
+
+rule RChange2_TA:
+  let sj    = h(<k,rnj>)
+      aj    = senc(sj,tidj)
+      rj    = h(<idj,tidj,aj,sj,ts5>)
+      mj    = senc(idj2,rnj)
+      tidj2 = senc(rnj,h(idj2))
+      aj2   = senc(sj,tidj2)
+      nj    = h(<tidj2,sj,~ts6>)
+  in
+  [ !Master(k), TARDB(idj,tidj,rnj)
+  , In(<'rchg5',tidj,sj,mj,rj,ts5>), Fr(~ts6)
+  ]
+  --[ TAChangeRPrepare(idj,idj2,tidj,tidj2) ]->
+  [ Out(<'rchg6',nj,~ts6>)
+  , TACRWait7(idj,tidj,rnj,idj2,tidj2,sj,aj2,~ts6)
+  ]
+
+rule RChange3_R:
+  let tidj2 = senc(rnj,h(idj2))
+      aj2   = senc(sj,tidj2)
+      nj    = h(<tidj2,sj,ts6>)
+      ackj  = h(<tidj2,ts6,~ts7>)
+  in
+  [ RCWait6(idj,tidj,rnj,sj,aj,idj2)
+  , In(<'rchg6',nj,ts6>), Fr(~ts7)
+  ]
+  --[ RChangeAck(idj,idj2,tidj,tidj2) ]->
+  [ Out(<'rchg7',ackj,~ts7>)
+  , RCWait8(idj,tidj,rnj,sj,aj,idj2,tidj2,aj2,ts6)
+  ]
+
+rule RChange4_TA_Commit:
+  let ackj = h(<tidj2,ts6,ts7>)
+      confj = h(<tidj2,sj,~ts8>)
+  in
+  [ TACRWait7(idj,tidj,rnj,idj2,tidj2,sj,aj2,ts6)
+  , In(<'rchg7',ackj,ts7>), Fr(~ts8)
+  ]
+  --[ TAChangeRCommit(idj,idj2,tidj,tidj2) ]->
+  [ TARDB(idj2,tidj2,rnj), Out(<'rchg8',confj,~ts8>) ]
+
+rule RChange5_R_Commit:
+  [ RCWait8(idj,tidj,rnj,sj,aj,idj2,tidj2,aj2,ts6)
+  , In(<'rchg8',h(<tidj2,sj,ts8>),ts8>)
+  ]
+  --[ RChangeCommit(idj,idj2,tidj,tidj2) ]->
+  [ RReady(idj2,tidj2,rnj,sj,aj2) ]
+
+rule RChange_R_Rollback:
+  [ RCWait8(idj,tidj,rnj,sj,aj,idj2,tidj2,aj2,ts6) ]
+  --[ RChangeRollback(idj,idj2,tidj,tidj2) ]->
+  [ RReady(idj,tidj,rnj,sj,aj) ]
+
+rule RChange_TA_Rollback:
+  [ TACRWait7(idj,tidj,rnj,idj2,tidj2,sj,aj2,ts6) ]
+  --[ TAChangeRRollback(idj,idj2,tidj,tidj2) ]->
+  [ TARDB(idj,tidj,rnj) ]
+
+/* Executability. */
+lemma enrollment_executable:
+  exists-trace "Ex idj tidj #i. REnrollComplete(idj,tidj)@i"
+
+lemma maska_executable:
+  exists-trace
+  "Ex idi idj ti tj ti2 tj2 sk #i #j #k.
+     VAcceptR(idi,ti,tj,sk)@i
+   & RAcceptV(idj,tj,ti,sk)@j
+   & TAComplete(idi,idj,ti,ti2,tj,tj2,sk)@k"
+
+lemma vehicle_change_executable:
+  exists-trace "Ex i i2 t t2 #x. VChangeCommit(i,i2,t,t2)@x"
+
+lemma rsu_change_executable:
+  exists-trace "Ex j j2 t t2 #x. RChangeCommit(j,j2,t,t2)@x"
+
+
+lemma enrollment_authentication:
+  "All idj tidj #i. REnrollComplete(idj,tidj)@i
+   ==> (Ex #j. TAEnrollApprove(idj,tidj)@j & j<i)"
+
+lemma session_key_secrecy:
+  "All idi idj ti tj sk #i. TAIssue(idi,idj,ti,tj,sk)@i
+   ==> not (Ex #j. K(sk)@j)"
+
+lemma vehicle_authenticates_rsu:
+  "All idi ti tj sk #i. VAcceptR(idi,ti,tj,sk)@i
+   ==> (Ex idj #j. RSend6(idj,tj,ti,sk)@j & j<i)"
+
+lemma rsu_authenticates_vehicle:
+  "All idj tj ti sk #i. RAcceptV(idj,tj,ti,sk)@i
+   ==> (Ex idi #j. VSend7(idi,ti,tj,sk)@j & j<i)"
+
+
+lemma vehicle_change_atomicity:
+  "All i i2 t t2 #x #y.
+     TAChangeVCommit(i,i2,t,t2)@x & VChangeRollback(i,i2,t,t2)@y ==> F"
+
+lemma rsu_change_atomicity:
+  "All j j2 t t2 #x #y.
+     TAChangeRCommit(j,j2,t,t2)@x & RChangeRollback(j,j2,t,t2)@y ==> F"
+
+
+lemma rsu_change_long_term_secret_secrecy:
+  "All j sj #i. RChangeSentLongTermSecret(j,sj)@i
+   ==> not (Ex #k. K(sj)@k)"
+
+/* The paper's A_i+ update makes a second TA-accepted MASKA run impossible. */
+lemma at_most_one_ta_session_per_vehicle:
+  "All i j1 j2 ti1 ti2 tj1 tj2 sk1 sk2 #x #y.
+     TAIssue(i,j1,ti1,tj1,sk1)@x & TAIssue(i,j2,ti2,tj2,sk2)@y
+     ==> #x=#y"
+
+end
