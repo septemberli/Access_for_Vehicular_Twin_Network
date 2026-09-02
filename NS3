@@ -1,0 +1,1045 @@
+#include "ns3/core-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/network-module.h"
+#include "ns3/ns2-mobility-helper.h"
+#include "ns3/olsr-helper.h"
+#include "ns3/wifi-module.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <numeric>
+#include <regex>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace ns3;
+
+namespace
+{
+
+constexpr uint16_t APP_PORT = 5000;
+constexpr uint32_t BSM_SIZE = 200;
+
+enum class TrafficType : uint8_t
+{
+    BSM = 0,
+    AUTH = 1
+};
+
+enum class Direction : uint8_t
+{
+    V2R = 0,
+    R2V = 1
+};
+
+struct MessageSpec
+{
+    uint8_t step{0};
+    std::string name;
+    Direction direction{Direction::V2R};
+    uint32_t payloadBytes{0};
+    double preSendDelayMs{0.0};
+};
+
+struct ProtocolProfile
+{
+    std::string name;
+    std::vector<MessageSpec> messages;
+    double finalProcessingMs{0.0};
+};
+
+std::string
+Trim(const std::string& input)
+{
+    const auto first = input.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+    {
+        return "";
+    }
+    const auto last = input.find_last_not_of(" \t\r\n");
+    return input.substr(first, last - first + 1);
+}
+
+std::vector<std::string>
+SplitCsv(const std::string& line)
+{
+    std::vector<std::string> fields;
+    std::stringstream stream(line);
+    std::string field;
+    while (std::getline(stream, field, ','))
+    {
+        fields.push_back(Trim(field));
+    }
+    return fields;
+}
+
+std::string
+BaseNameWithoutExtension(const std::string& path)
+{
+    const size_t slash = path.find_last_of("/\\");
+    const std::string base = slash == std::string::npos ? path : path.substr(slash + 1);
+    const size_t dot = base.find_last_of('.');
+    return dot == std::string::npos ? base : base.substr(0, dot);
+}
+
+ProtocolProfile
+ReadProtocolProfile(const std::string& fileName)
+{
+    std::ifstream input(fileName);
+    NS_ABORT_MSG_IF(!input.is_open(), "Cannot open protocol profile: " << fileName);
+
+    ProtocolProfile profile;
+    profile.name = BaseNameWithoutExtension(fileName);
+    std::string line;
+    bool sawHeader = false;
+    while (std::getline(input, line))
+    {
+        line = Trim(line);
+        if (line.empty())
+        {
+            continue;
+        }
+        if (line.rfind("#", 0) == 0)
+        {
+            const std::string key = "# final_processing_ms=";
+            if (line.rfind(key, 0) == 0)
+            {
+                profile.finalProcessingMs = std::stod(Trim(line.substr(key.size())));
+            }
+            continue;
+        }
+        if (!sawHeader)
+        {
+            NS_ABORT_MSG_IF(line != "step,name,direction,payload_bytes,pre_send_delay_ms",
+                            "Unexpected protocol CSV header: " << line);
+            sawHeader = true;
+            continue;
+        }
+        const auto fields = SplitCsv(line);
+        NS_ABORT_MSG_IF(fields.size() != 5, "Malformed protocol row: " << line);
+        MessageSpec spec;
+        spec.step = static_cast<uint8_t>(std::stoul(fields[0]));
+        spec.name = fields[1];
+        if (fields[2] == "V2R")
+        {
+            spec.direction = Direction::V2R;
+        }
+        else if (fields[2] == "R2V")
+        {
+            spec.direction = Direction::R2V;
+        }
+        else
+        {
+            NS_FATAL_ERROR("Unknown direction in protocol row: " << fields[2]);
+        }
+        spec.payloadBytes = static_cast<uint32_t>(std::stoul(fields[3]));
+        spec.preSendDelayMs = std::stod(fields[4]);
+        NS_ABORT_MSG_IF(spec.step != profile.messages.size(),
+                        "Protocol steps must be contiguous and zero-based");
+        NS_ABORT_MSG_IF(spec.payloadBytes == 0, "Protocol payload size must be positive");
+        profile.messages.push_back(spec);
+    }
+    NS_ABORT_MSG_IF(profile.messages.empty(), "Protocol profile has no messages");
+    NS_ABORT_MSG_IF(profile.messages.front().direction != Direction::V2R,
+                    "The first protocol message must be V2R");
+    return profile;
+}
+
+class BenchmarkTag : public Tag
+{
+  public:
+    BenchmarkTag() = default;
+
+    BenchmarkTag(uint32_t vehicleId,
+                 TrafficType traffic,
+                 uint8_t step,
+                 uint8_t attempt,
+                 uint32_t sequence,
+                 uint64_t txTimeNs)
+        : m_vehicleId(vehicleId),
+          m_traffic(static_cast<uint8_t>(traffic)),
+          m_step(step),
+          m_attempt(attempt),
+          m_sequence(sequence),
+          m_txTimeNs(txTimeNs)
+    {
+    }
+
+    static TypeId GetTypeId()
+    {
+        static TypeId tid = TypeId("ns3::SutdProtocolBenchmarkTag")
+                                .SetParent<Tag>()
+                                .AddConstructor<BenchmarkTag>();
+        return tid;
+    }
+
+    TypeId GetInstanceTypeId() const override
+    {
+        return GetTypeId();
+    }
+
+    uint32_t GetSerializedSize() const override
+    {
+        return 20;
+    }
+
+    void Serialize(TagBuffer buffer) const override
+    {
+        buffer.WriteU32(m_vehicleId);
+        buffer.WriteU8(m_traffic);
+        buffer.WriteU8(m_step);
+        buffer.WriteU8(m_attempt);
+        buffer.WriteU8(0);
+        buffer.WriteU32(m_sequence);
+        buffer.WriteU64(m_txTimeNs);
+    }
+
+    void Deserialize(TagBuffer buffer) override
+    {
+        m_vehicleId = buffer.ReadU32();
+        m_traffic = buffer.ReadU8();
+        m_step = buffer.ReadU8();
+        m_attempt = buffer.ReadU8();
+        buffer.ReadU8();
+        m_sequence = buffer.ReadU32();
+        m_txTimeNs = buffer.ReadU64();
+    }
+
+    void Print(std::ostream& os) const override
+    {
+        os << "vehicle=" << m_vehicleId << ",traffic=" << unsigned(m_traffic)
+           << ",step=" << unsigned(m_step) << ",attempt=" << unsigned(m_attempt)
+           << ",sequence=" << m_sequence << ",tx_ns=" << m_txTimeNs;
+    }
+
+    uint32_t GetVehicleId() const
+    {
+        return m_vehicleId;
+    }
+
+    TrafficType GetTrafficType() const
+    {
+        return static_cast<TrafficType>(m_traffic);
+    }
+
+    uint8_t GetStep() const
+    {
+        return m_step;
+    }
+
+    uint8_t GetAttempt() const
+    {
+        return m_attempt;
+    }
+
+    uint64_t GetTxTimeNs() const
+    {
+        return m_txTimeNs;
+    }
+
+  private:
+    uint32_t m_vehicleId{0};
+    uint8_t m_traffic{0};
+    uint8_t m_step{0};
+    uint8_t m_attempt{0};
+    uint32_t m_sequence{0};
+    uint64_t m_txTimeNs{0};
+};
+
+struct ActivityInterval
+{
+    double start{0.0};
+    double stop{0.0};
+    bool hasStart{false};
+    bool hasStop{false};
+};
+
+struct Metric
+{
+    uint64_t txPackets{0};
+    uint64_t rxPackets{0};
+    uint64_t txBytes{0};
+    uint64_t rxBytes{0};
+    std::vector<double> delaysMs;
+};
+
+struct TimeBin
+{
+    uint64_t txPackets{0};
+    uint64_t rxPackets{0};
+    uint64_t rxBytes{0};
+    double delaySumMs{0.0};
+    uint64_t delayCount{0};
+};
+
+struct VehicleState
+{
+    uint8_t attempt{0};
+    uint8_t expectedStep{0};
+    bool completed{false};
+    int32_t rsuIndex{-1};
+    double authStartS{-1.0};
+};
+
+struct SummaryStats
+{
+    double mean{0.0};
+    double median{0.0};
+    double p95{0.0};
+    double maximum{0.0};
+};
+
+NodeContainer g_vehicles;
+NodeContainer g_rsus;
+NetDeviceContainer g_vehicleDevices;
+NetDeviceContainer g_rsuDevices;
+std::vector<Ipv4Address> g_vehicleAddresses;
+std::vector<Ipv4Address> g_rsuAddresses;
+std::vector<Ptr<Socket>> g_vehicleSockets;
+std::vector<Ptr<Socket>> g_rsuSockets;
+std::vector<ActivityInterval> g_activity;
+std::vector<VehicleState> g_state;
+ProtocolProfile g_profile;
+
+Metric g_bsmMetric;
+Metric g_authMetric;
+std::vector<Metric> g_messageMetrics;
+std::vector<TimeBin> g_bsmBins;
+std::vector<TimeBin> g_authBins;
+std::vector<double> g_completionLatenciesMs;
+
+double g_durationS = 600.0;
+double g_coverageM = 300.0;
+double g_bsmIntervalS = 0.1;
+double g_authTimeoutS = 0.8;
+uint32_t g_maxAuthAttempts = 3;
+bool g_enableBsm = true;
+bool g_enableOlsr = true;
+uint32_t g_coverageMisses = 0;
+uint32_t g_sequence = 0;
+
+double
+Pdr(uint64_t tx, uint64_t rx)
+{
+    if (tx == 0)
+    {
+        return 0.0;
+    }
+    return 100.0 * static_cast<double>(std::min(tx, rx)) / static_cast<double>(tx);
+}
+
+SummaryStats
+Summarize(std::vector<double> values)
+{
+    SummaryStats stats;
+    if (values.empty())
+    {
+        return stats;
+    }
+    std::sort(values.begin(), values.end());
+    stats.mean = std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+    stats.median = values[values.size() / 2];
+    stats.p95 = values[std::min(values.size() - 1,
+                                static_cast<size_t>(std::ceil(0.95 * values.size())) - 1)];
+    stats.maximum = values.back();
+    return stats;
+}
+
+std::vector<ActivityInterval>
+ReadActivityTrace(const std::string& fileName, uint32_t expectedVehicles)
+{
+    std::ifstream input(fileName);
+    NS_ABORT_MSG_IF(!input.is_open(), "Cannot open activity trace: " << fileName);
+    std::vector<ActivityInterval> intervals(expectedVehicles);
+    const std::regex pattern(
+        R"trace(\$ns_ at ([0-9]+(?:\.[0-9]+)?) "\$g\(([0-9]+)\) (start|stop)")trace");
+    std::string line;
+    std::smatch match;
+    while (std::getline(input, line))
+    {
+        if (!std::regex_search(line, match, pattern))
+        {
+            continue;
+        }
+        const double time = std::stod(match[1].str());
+        const uint32_t index = static_cast<uint32_t>(std::stoul(match[2].str()));
+        if (index >= expectedVehicles)
+        {
+            continue;
+        }
+        if (match[3].str() == "start")
+        {
+            if (!intervals[index].hasStart)
+            {
+                intervals[index].start = time;
+                intervals[index].hasStart = true;
+            }
+        }
+        else
+        {
+            intervals[index].stop = std::max(intervals[index].stop, time);
+            intervals[index].hasStop = true;
+        }
+    }
+    for (uint32_t i = 0; i < expectedVehicles; ++i)
+    {
+        NS_ABORT_MSG_IF(!intervals[i].hasStart, "Missing activity start for vehicle " << i);
+        if (!intervals[i].hasStop)
+        {
+            intervals[i].stop = g_durationS;
+        }
+        intervals[i].stop = std::min(intervals[i].stop, g_durationS);
+    }
+    return intervals;
+}
+
+std::vector<Vector>
+ReadRsuPositions(const std::string& fileName, uint32_t expectedRsus)
+{
+    std::ifstream input(fileName);
+    NS_ABORT_MSG_IF(!input.is_open(), "Cannot open RSU position CSV: " << fileName);
+    std::vector<Vector> positions;
+    std::string line;
+    std::getline(input, line);
+    while (std::getline(input, line))
+    {
+        const auto fields = SplitCsv(line);
+        if (fields.size() >= 3)
+        {
+            positions.emplace_back(std::stod(fields[1]), std::stod(fields[2]), 3.0);
+        }
+    }
+    NS_ABORT_MSG_IF(positions.size() < expectedRsus,
+                    "RSU CSV has " << positions.size() << " rows; expected " << expectedRsus);
+    positions.resize(expectedRsus);
+    return positions;
+}
+
+int32_t
+FindNearestRsu(uint32_t vehicleId)
+{
+    Ptr<MobilityModel> vehicle = g_vehicles.Get(vehicleId)->GetObject<MobilityModel>();
+    double best = std::numeric_limits<double>::max();
+    int32_t bestIndex = -1;
+    for (uint32_t i = 0; i < g_rsus.GetN(); ++i)
+    {
+        const double distance =
+            vehicle->GetDistanceFrom(g_rsus.Get(i)->GetObject<MobilityModel>());
+        if (distance < best)
+        {
+            best = distance;
+            bestIndex = static_cast<int32_t>(i);
+        }
+    }
+    return best <= g_coverageM ? bestIndex : -1;
+}
+
+size_t
+CurrentBin()
+{
+    const double now = std::max(0.0, Simulator::Now().GetSeconds());
+    return std::min(g_bsmBins.size() - 1, static_cast<size_t>(std::floor(now)));
+}
+
+void
+RecordTx(Metric& metric, std::vector<TimeBin>& bins, uint32_t bytes)
+{
+    ++metric.txPackets;
+    metric.txBytes += bytes;
+    ++bins[CurrentBin()].txPackets;
+}
+
+void
+RecordRx(Metric& metric, std::vector<TimeBin>& bins, uint32_t bytes, double delayMs)
+{
+    ++metric.rxPackets;
+    metric.rxBytes += bytes;
+    metric.delaysMs.push_back(delayMs);
+    TimeBin& bin = bins[CurrentBin()];
+    ++bin.rxPackets;
+    bin.rxBytes += bytes;
+    bin.delaySumMs += delayMs;
+    ++bin.delayCount;
+}
+
+void
+SetVehicleInterface(uint32_t vehicleId, bool up)
+{
+    Ptr<Ipv4> ipv4 = g_vehicles.Get(vehicleId)->GetObject<Ipv4>();
+    if (up)
+    {
+        ipv4->SetUp(1);
+    }
+    else
+    {
+        ipv4->SetDown(1);
+    }
+}
+
+void
+SendUdp(Ptr<Socket> socket,
+        Ipv4Address destination,
+        uint32_t vehicleId,
+        TrafficType traffic,
+        uint8_t step,
+        uint8_t attempt,
+        uint32_t bytes)
+{
+    Ptr<Packet> packet = Create<Packet>(bytes);
+    packet->AddPacketTag(BenchmarkTag(vehicleId,
+                                      traffic,
+                                      step,
+                                      attempt,
+                                      ++g_sequence,
+                                      Simulator::Now().GetNanoSeconds()));
+    const int sent = socket->SendTo(packet, 0, InetSocketAddress(destination, APP_PORT));
+    if (sent < 0)
+    {
+        return;
+    }
+    if (traffic == TrafficType::BSM)
+    {
+        RecordTx(g_bsmMetric, g_bsmBins, bytes);
+    }
+    else
+    {
+        RecordTx(g_authMetric, g_authBins, bytes);
+        ++g_messageMetrics[step].txPackets;
+        g_messageMetrics[step].txBytes += bytes;
+    }
+}
+
+void StartAuthentication(uint32_t vehicleId);
+void SendAuthStep(uint32_t vehicleId, uint8_t attempt, uint8_t step);
+
+void
+AuthenticationTimeout(uint32_t vehicleId, uint8_t attempt)
+{
+    VehicleState& state = g_state[vehicleId];
+    if (state.completed || state.attempt != attempt ||
+        Simulator::Now().GetSeconds() >= g_activity[vehicleId].stop)
+    {
+        return;
+    }
+    if (state.attempt < g_maxAuthAttempts)
+    {
+        StartAuthentication(vehicleId);
+    }
+}
+
+void
+SendAuthStep(uint32_t vehicleId, uint8_t attempt, uint8_t step)
+{
+    VehicleState& state = g_state[vehicleId];
+    if (state.completed || state.attempt != attempt || state.expectedStep != step ||
+        Simulator::Now().GetSeconds() >= g_activity[vehicleId].stop)
+    {
+        return;
+    }
+    const MessageSpec& message = g_profile.messages[step];
+    if (message.direction == Direction::V2R)
+    {
+        SendUdp(g_vehicleSockets[vehicleId],
+                g_rsuAddresses.at(static_cast<size_t>(state.rsuIndex)),
+                vehicleId,
+                TrafficType::AUTH,
+                step,
+                attempt,
+                message.payloadBytes);
+    }
+    else
+    {
+        const uint32_t rsu = static_cast<uint32_t>(state.rsuIndex);
+        SendUdp(g_rsuSockets[rsu],
+                g_vehicleAddresses[vehicleId],
+                vehicleId,
+                TrafficType::AUTH,
+                step,
+                attempt,
+                message.payloadBytes);
+    }
+    if (step == 0)
+    {
+        Simulator::Schedule(Seconds(g_authTimeoutS),
+                            &AuthenticationTimeout,
+                            vehicleId,
+                            attempt);
+    }
+}
+
+void
+StartAuthentication(uint32_t vehicleId)
+{
+    VehicleState& state = g_state[vehicleId];
+    if (state.completed || Simulator::Now().GetSeconds() >= g_activity[vehicleId].stop)
+    {
+        return;
+    }
+    const int32_t rsu = FindNearestRsu(vehicleId);
+    if (rsu < 0)
+    {
+        ++g_coverageMisses;
+        Simulator::Schedule(MilliSeconds(100), &StartAuthentication, vehicleId);
+        return;
+    }
+    state.rsuIndex = rsu;
+    ++state.attempt;
+    state.expectedStep = 0;
+    if (state.authStartS < 0.0)
+    {
+        state.authStartS = Simulator::Now().GetSeconds();
+    }
+    Simulator::Schedule(MilliSeconds(g_profile.messages[0].preSendDelayMs),
+                        &SendAuthStep,
+                        vehicleId,
+                        state.attempt,
+                        0);
+}
+
+void
+CompleteAuthentication(uint32_t vehicleId, uint8_t attempt)
+{
+    VehicleState& state = g_state[vehicleId];
+    if (state.completed || state.attempt != attempt)
+    {
+        return;
+    }
+    state.completed = true;
+    if (state.authStartS >= 0.0)
+    {
+        g_completionLatenciesMs.push_back(
+            (Simulator::Now().GetSeconds() - state.authStartS) * 1000.0);
+    }
+}
+
+void
+HandleAuthReception(const BenchmarkTag& tag, Direction receiverDirection)
+{
+    const uint32_t vehicleId = tag.GetVehicleId();
+    if (vehicleId >= g_state.size() || tag.GetStep() >= g_profile.messages.size())
+    {
+        return;
+    }
+    const MessageSpec& received = g_profile.messages[tag.GetStep()];
+    if (received.direction != receiverDirection)
+    {
+        return;
+    }
+    const double delayMs =
+        (Simulator::Now().GetNanoSeconds() - tag.GetTxTimeNs()) / 1000000.0;
+    RecordRx(g_authMetric, g_authBins, received.payloadBytes, delayMs);
+    ++g_messageMetrics[tag.GetStep()].rxPackets;
+    g_messageMetrics[tag.GetStep()].rxBytes += received.payloadBytes;
+    g_messageMetrics[tag.GetStep()].delaysMs.push_back(delayMs);
+
+    VehicleState& state = g_state[vehicleId];
+    if (state.completed || state.attempt != tag.GetAttempt() ||
+        state.expectedStep != tag.GetStep())
+    {
+        return;
+    }
+    state.expectedStep = static_cast<uint8_t>(tag.GetStep() + 1);
+    if (state.expectedStep == g_profile.messages.size())
+    {
+        Simulator::Schedule(MilliSeconds(g_profile.finalProcessingMs),
+                            &CompleteAuthentication,
+                            vehicleId,
+                            tag.GetAttempt());
+        return;
+    }
+    const MessageSpec& next = g_profile.messages[state.expectedStep];
+    Simulator::Schedule(MilliSeconds(next.preSendDelayMs),
+                        &SendAuthStep,
+                        vehicleId,
+                        tag.GetAttempt(),
+                        state.expectedStep);
+}
+
+void
+ReceiveAtRsu(uint32_t, Ptr<Socket> socket)
+{
+    Address from;
+    while (Ptr<Packet> packet = socket->RecvFrom(from))
+    {
+        BenchmarkTag tag;
+        if (!packet->PeekPacketTag(tag))
+        {
+            continue;
+        }
+        const double delayMs =
+            (Simulator::Now().GetNanoSeconds() - tag.GetTxTimeNs()) / 1000000.0;
+        if (tag.GetTrafficType() == TrafficType::BSM)
+        {
+            RecordRx(g_bsmMetric, g_bsmBins, packet->GetSize(), delayMs);
+        }
+        else
+        {
+            HandleAuthReception(tag, Direction::V2R);
+        }
+    }
+}
+
+void
+ReceiveAtVehicle(uint32_t vehicleId, Ptr<Socket> socket)
+{
+    Address from;
+    while (Ptr<Packet> packet = socket->RecvFrom(from))
+    {
+        BenchmarkTag tag;
+        if (!packet->PeekPacketTag(tag) || tag.GetVehicleId() != vehicleId ||
+            tag.GetTrafficType() != TrafficType::AUTH)
+        {
+            continue;
+        }
+        HandleAuthReception(tag, Direction::R2V);
+    }
+}
+
+void
+SendBsm(uint32_t vehicleId)
+{
+    const double now = Simulator::Now().GetSeconds();
+    if (now >= g_activity[vehicleId].stop || now >= g_durationS)
+    {
+        return;
+    }
+    const int32_t rsu = FindNearestRsu(vehicleId);
+    if (rsu >= 0)
+    {
+        SendUdp(g_vehicleSockets[vehicleId],
+                g_rsuAddresses.at(static_cast<size_t>(rsu)),
+                vehicleId,
+                TrafficType::BSM,
+                0,
+                0,
+                BSM_SIZE);
+    }
+    Simulator::Schedule(Seconds(g_bsmIntervalS), &SendBsm, vehicleId);
+}
+
+void
+AppendAggregateCsv(const std::string& outputCsv,
+                   uint32_t run,
+                   uint32_t vehicles,
+                   uint32_t rsus,
+                   uint32_t completed,
+                   uint32_t eligible)
+{
+    const uint64_t totalTx = g_bsmMetric.txPackets + g_authMetric.txPackets;
+    const uint64_t totalRx = g_bsmMetric.rxPackets + g_authMetric.rxPackets;
+    const uint64_t totalRxBytes = g_bsmMetric.rxBytes + g_authMetric.rxBytes;
+    std::vector<double> totalDelays = g_bsmMetric.delaysMs;
+    totalDelays.insert(totalDelays.end(), g_authMetric.delaysMs.begin(), g_authMetric.delaysMs.end());
+    const SummaryStats bsmDelay = Summarize(g_bsmMetric.delaysMs);
+    const SummaryStats authDelay = Summarize(g_authMetric.delaysMs);
+    const SummaryStats totalDelay = Summarize(totalDelays);
+    const SummaryStats completionDelay = Summarize(g_completionLatenciesMs);
+
+    std::ifstream existing(outputCsv);
+    const bool exists = existing.good() && existing.peek() != std::ifstream::traits_type::eof();
+    existing.close();
+    std::ofstream output(outputCsv, std::ios::app);
+    NS_ABORT_MSG_IF(!output.is_open(), "Cannot open output CSV: " << outputCsv);
+    if (!exists)
+    {
+        output << "run,protocol,vehicles,rsus,duration_s,olsr_enabled,bsm_enabled,"
+                  "bsm_tx,bsm_rx,bsm_pdr_pct,bsm_throughput_kbps,bsm_e2e_mean_ms,bsm_e2e_p95_ms,"
+                  "auth_tx,auth_rx,auth_pdr_pct,auth_throughput_kbps,auth_e2e_mean_ms,auth_e2e_p95_ms,"
+                  "total_tx,total_rx,total_pdr_pct,total_throughput_kbps,total_e2e_mean_ms,total_e2e_p95_ms,"
+                  "auth_completed,auth_eligible,auth_completion_pct,auth_completion_mean_ms,"
+                  "auth_completion_p95_ms,coverage_misses\n";
+    }
+    const double completionPct =
+        eligible == 0 ? 0.0 : 100.0 * completed / static_cast<double>(eligible);
+    output << run << ',' << g_profile.name << ',' << vehicles << ',' << rsus << ','
+           << std::fixed << std::setprecision(6) << g_durationS << ','
+           << (g_enableOlsr ? 1 : 0) << ',' << (g_enableBsm ? 1 : 0) << ','
+           << g_bsmMetric.txPackets << ',' << g_bsmMetric.rxPackets << ','
+           << Pdr(g_bsmMetric.txPackets, g_bsmMetric.rxPackets) << ','
+           << g_bsmMetric.rxBytes * 8.0 / (g_durationS * 1000.0) << ','
+           << bsmDelay.mean << ',' << bsmDelay.p95 << ',' << g_authMetric.txPackets << ','
+           << g_authMetric.rxPackets << ',' << Pdr(g_authMetric.txPackets, g_authMetric.rxPackets)
+           << ',' << g_authMetric.rxBytes * 8.0 / (g_durationS * 1000.0) << ','
+           << authDelay.mean << ',' << authDelay.p95 << ',' << totalTx << ',' << totalRx << ','
+           << Pdr(totalTx, totalRx) << ',' << totalRxBytes * 8.0 / (g_durationS * 1000.0)
+           << ',' << totalDelay.mean << ',' << totalDelay.p95 << ',' << completed << ','
+           << eligible << ',' << completionPct << ',' << completionDelay.mean << ','
+           << completionDelay.p95 << ',' << g_coverageMisses << '\n';
+}
+
+void
+AppendMessageCsv(const std::string& messageCsv, uint32_t run)
+{
+    if (messageCsv.empty())
+    {
+        return;
+    }
+    std::ifstream existing(messageCsv);
+    const bool exists = existing.good() && existing.peek() != std::ifstream::traits_type::eof();
+    existing.close();
+    std::ofstream output(messageCsv, std::ios::app);
+    NS_ABORT_MSG_IF(!output.is_open(), "Cannot open message CSV: " << messageCsv);
+    if (!exists)
+    {
+        output << "run,protocol,step,message,direction,payload_bytes,tx,rx,pdr_pct,"
+                  "throughput_kbps,e2e_mean_ms,e2e_p95_ms\n";
+    }
+    for (size_t i = 0; i < g_profile.messages.size(); ++i)
+    {
+        const MessageSpec& spec = g_profile.messages[i];
+        const Metric& metric = g_messageMetrics[i];
+        const SummaryStats delay = Summarize(metric.delaysMs);
+        output << run << ',' << g_profile.name << ',' << i << ',' << spec.name << ','
+               << (spec.direction == Direction::V2R ? "V2R" : "R2V") << ','
+               << spec.payloadBytes << ',' << metric.txPackets << ',' << metric.rxPackets << ','
+               << std::fixed << std::setprecision(6) << Pdr(metric.txPackets, metric.rxPackets)
+               << ',' << metric.rxBytes * 8.0 / (g_durationS * 1000.0) << ',' << delay.mean
+               << ',' << delay.p95 << '\n';
+    }
+}
+
+void
+WriteTimeSeriesCsv(const std::string& fileName, uint32_t run)
+{
+    if (fileName.empty())
+    {
+        return;
+    }
+    std::ofstream output(fileName);
+    NS_ABORT_MSG_IF(!output.is_open(), "Cannot open time-series CSV: " << fileName);
+    output << "run,protocol,second,bsm_tx,bsm_rx,bsm_pdr_pct,bsm_throughput_kbps,"
+              "bsm_e2e_mean_ms,auth_tx,auth_rx,auth_pdr_pct,auth_throughput_kbps,"
+              "auth_e2e_mean_ms,total_tx,total_rx,total_pdr_pct,total_throughput_kbps,"
+              "total_e2e_mean_ms\n";
+    uint64_t cumulativeBsmTx = 0;
+    uint64_t cumulativeBsmRx = 0;
+    uint64_t cumulativeAuthTx = 0;
+    uint64_t cumulativeAuthRx = 0;
+    for (size_t second = 0; second < g_bsmBins.size(); ++second)
+    {
+        const TimeBin& bsm = g_bsmBins[second];
+        const TimeBin& auth = g_authBins[second];
+        cumulativeBsmTx += bsm.txPackets;
+        cumulativeBsmRx += bsm.rxPackets;
+        cumulativeAuthTx += auth.txPackets;
+        cumulativeAuthRx += auth.rxPackets;
+        const uint64_t totalTx = bsm.txPackets + auth.txPackets;
+        const uint64_t totalRx = bsm.rxPackets + auth.rxPackets;
+        const uint64_t totalBytes = bsm.rxBytes + auth.rxBytes;
+        const uint64_t totalDelayCount = bsm.delayCount + auth.delayCount;
+        const double totalDelay = totalDelayCount == 0
+                                      ? 0.0
+                                      : (bsm.delaySumMs + auth.delaySumMs) / totalDelayCount;
+        output << run << ',' << g_profile.name << ',' << second << ',' << bsm.txPackets << ','
+               << bsm.rxPackets << ',' << std::fixed << std::setprecision(6)
+               << Pdr(cumulativeBsmTx, cumulativeBsmRx) << ',' << bsm.rxBytes * 8.0 / 1000.0
+               << ',' << (bsm.delayCount == 0 ? 0.0 : bsm.delaySumMs / bsm.delayCount) << ','
+               << auth.txPackets << ',' << auth.rxPackets << ','
+               << Pdr(cumulativeAuthTx, cumulativeAuthRx) << ',' << auth.rxBytes * 8.0 / 1000.0
+               << ',' << (auth.delayCount == 0 ? 0.0 : auth.delaySumMs / auth.delayCount)
+               << ',' << totalTx << ',' << totalRx << ','
+               << Pdr(cumulativeBsmTx + cumulativeAuthTx,
+                      cumulativeBsmRx + cumulativeAuthRx)
+               << ','
+               << totalBytes * 8.0 / 1000.0 << ',' << totalDelay << '\n';
+    }
+}
+
+} // namespace
+
+int
+main(int argc, char* argv[])
+{
+    uint32_t run = 1;
+    uint32_t vehicles = 200;
+    uint32_t rsus = 50;
+    std::string mobilityTrace;
+    std::string activityTrace;
+    std::string rsuCsv;
+    std::string protocolCsv;
+    std::string outputCsv = "aggregate_results.csv";
+    std::string messageCsv;
+    std::string timeSeriesCsv;
+
+    CommandLine cmd(__FILE__);
+    cmd.AddValue("run", "Independent ns-3 RNG run", run);
+    cmd.AddValue("vehicles", "Number of SUMO vehicle nodes", vehicles);
+    cmd.AddValue("rsus", "Number of RSUs", rsus);
+    cmd.AddValue("duration", "Simulation duration in seconds", g_durationS);
+    cmd.AddValue("coverage", "Application-level RSU coverage radius in metres", g_coverageM);
+    cmd.AddValue("bsmInterval", "BSM interval in seconds", g_bsmIntervalS);
+    cmd.AddValue("enableBsm", "Enable periodic 200-byte BSM uplink traffic", g_enableBsm);
+    cmd.AddValue("enableOlsr", "Enable OLSR control traffic", g_enableOlsr);
+    cmd.AddValue("authTimeout", "Authentication timeout in seconds", g_authTimeoutS);
+    cmd.AddValue("maxAuthAttempts", "Maximum authentication transmissions", g_maxAuthAttempts);
+    cmd.AddValue("mobilityTrace", "SUMO-derived ns-2 mobility trace", mobilityTrace);
+    cmd.AddValue("activityTrace", "SUMO-derived ns-2 activity trace", activityTrace);
+    cmd.AddValue("rsuCsv", "CSV with RSU positions", rsuCsv);
+    cmd.AddValue("protocolCsv", "Generic protocol profile CSV", protocolCsv);
+    cmd.AddValue("outputCsv", "Append-only aggregate results CSV", outputCsv);
+    cmd.AddValue("messageCsv", "Append-only per-message results CSV", messageCsv);
+    cmd.AddValue("timeSeriesCsv", "Per-second result CSV for this run", timeSeriesCsv);
+    cmd.Parse(argc, argv);
+
+    NS_ABORT_MSG_IF(mobilityTrace.empty(), "--mobilityTrace is required");
+    NS_ABORT_MSG_IF(activityTrace.empty(), "--activityTrace is required");
+    NS_ABORT_MSG_IF(rsuCsv.empty(), "--rsuCsv is required");
+    NS_ABORT_MSG_IF(protocolCsv.empty(), "--protocolCsv is required");
+    NS_ABORT_MSG_IF(vehicles == 0 || rsus == 0, "vehicles and RSUs must be positive");
+    NS_ABORT_MSG_IF(g_durationS <= 0 || g_bsmIntervalS <= 0, "invalid timing parameter");
+
+    g_profile = ReadProtocolProfile(protocolCsv);
+    g_messageMetrics.resize(g_profile.messages.size());
+    const size_t binCount = std::max<size_t>(1, static_cast<size_t>(std::ceil(g_durationS)));
+    g_bsmBins.resize(binCount);
+    g_authBins.resize(binCount);
+    g_activity = ReadActivityTrace(activityTrace, vehicles);
+    g_state.resize(vehicles);
+
+    RngSeedManager::SetSeed(20260823);
+    RngSeedManager::SetRun(run);
+
+    g_vehicles.Create(vehicles);
+    Ns2MobilityHelper ns2Mobility(mobilityTrace);
+    ns2Mobility.Install();
+
+    g_rsus.Create(rsus);
+    MobilityHelper rsuMobility;
+    Ptr<ListPositionAllocator> positions = CreateObject<ListPositionAllocator>();
+    for (const Vector& position : ReadRsuPositions(rsuCsv, rsus))
+    {
+        positions->Add(position);
+    }
+    rsuMobility.SetPositionAllocator(positions);
+    rsuMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    rsuMobility.Install(g_rsus);
+
+    NodeContainer allNodes(g_vehicles, g_rsus);
+    YansWifiChannelHelper channel;
+    channel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
+    channel.AddPropagationLoss("ns3::FriisPropagationLossModel",
+                               "Frequency",
+                               DoubleValue(5.9e9));
+    channel.AddPropagationLoss("ns3::NakagamiPropagationLossModel");
+    YansWifiPhyHelper phy;
+    phy.SetChannel(channel.Create());
+    phy.Set("ChannelSettings", StringValue("{178, 10, BAND_5GHZ, 0}"));
+    phy.Set("TxPowerStart", DoubleValue(20.0));
+    phy.Set("TxPowerEnd", DoubleValue(20.0));
+
+    WifiHelper wifi;
+    wifi.SetStandard(WIFI_STANDARD_80211p);
+    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager",
+                                 "DataMode",
+                                 StringValue("OfdmRate6MbpsBW10MHz"),
+                                 "ControlMode",
+                                 StringValue("OfdmRate6MbpsBW10MHz"));
+    WifiMacHelper mac;
+    mac.SetType("ns3::AdhocWifiMac");
+    NetDeviceContainer allDevices = wifi.Install(phy, mac, allNodes);
+    for (uint32_t i = 0; i < vehicles; ++i)
+    {
+        g_vehicleDevices.Add(allDevices.Get(i));
+    }
+    for (uint32_t i = 0; i < rsus; ++i)
+    {
+        g_rsuDevices.Add(allDevices.Get(vehicles + i));
+    }
+
+    InternetStackHelper internet;
+    if (g_enableOlsr)
+    {
+        OlsrHelper olsr;
+        Ipv4StaticRoutingHelper staticRouting;
+        Ipv4ListRoutingHelper list;
+        list.Add(staticRouting, 0);
+        list.Add(olsr, 10);
+        internet.SetRoutingHelper(list);
+    }
+    internet.Install(allNodes);
+    Ipv4AddressHelper addresses;
+    addresses.SetBase("10.1.0.0", "255.255.0.0");
+    Ipv4InterfaceContainer interfaces = addresses.Assign(allDevices);
+    for (uint32_t i = 0; i < vehicles; ++i)
+    {
+        g_vehicleAddresses.push_back(interfaces.GetAddress(i));
+    }
+    for (uint32_t i = 0; i < rsus; ++i)
+    {
+        g_rsuAddresses.push_back(interfaces.GetAddress(vehicles + i));
+    }
+
+    g_vehicleSockets.resize(vehicles);
+    for (uint32_t i = 0; i < vehicles; ++i)
+    {
+        g_vehicleSockets[i] = Socket::CreateSocket(g_vehicles.Get(i), UdpSocketFactory::GetTypeId());
+        g_vehicleSockets[i]->Bind(InetSocketAddress(Ipv4Address::GetAny(), APP_PORT));
+        g_vehicleSockets[i]->SetRecvCallback(MakeBoundCallback(&ReceiveAtVehicle, i));
+        g_vehicles.Get(i)->GetObject<Ipv4>()->SetDown(1);
+    }
+    g_rsuSockets.resize(rsus);
+    for (uint32_t i = 0; i < rsus; ++i)
+    {
+        g_rsuSockets[i] = Socket::CreateSocket(g_rsus.Get(i), UdpSocketFactory::GetTypeId());
+        g_rsuSockets[i]->Bind(InetSocketAddress(Ipv4Address::GetAny(), APP_PORT));
+        g_rsuSockets[i]->SetRecvCallback(MakeBoundCallback(&ReceiveAtRsu, i));
+    }
+
+    for (uint32_t i = 0; i < vehicles; ++i)
+    {
+        const double start = std::max(0.0, g_activity[i].start);
+        const double stop = std::max(start + 0.001, g_activity[i].stop);
+        Simulator::Schedule(Seconds(start), &SetVehicleInterface, i, true);
+        Simulator::Schedule(Seconds(stop), &SetVehicleInterface, i, false);
+        Simulator::Schedule(Seconds(start + 0.05 + (i % 20) * 0.001),
+                            &StartAuthentication,
+                            i);
+        if (g_enableBsm)
+        {
+            Simulator::Schedule(Seconds(start + 0.10 + (i % 100) * 0.001), &SendBsm, i);
+        }
+    }
+
+    Simulator::Stop(Seconds(g_durationS));
+    Simulator::Run();
+
+    uint32_t completed = 0;
+    uint32_t eligible = 0;
+    for (uint32_t i = 0; i < vehicles; ++i)
+    {
+        if (g_activity[i].start >= g_durationS)
+        {
+            continue;
+        }
+        ++eligible;
+        completed += g_state[i].completed ? 1 : 0;
+    }
+
+    AppendAggregateCsv(outputCsv, run, vehicles, rsus, completed, eligible);
+    AppendMessageCsv(messageCsv, run);
+    WriteTimeSeriesCsv(timeSeriesCsv, run);
+
+    const SummaryStats authDelay = Summarize(g_authMetric.delaysMs);
+    const SummaryStats completionDelay = Summarize(g_completionLatenciesMs);
+    std::cout << "SUTD benchmark: protocol=" << g_profile.name << ", vehicles=" << vehicles
+              << ", RSUs=" << rsus << ", run=" << run << ", total throughput="
+              << std::fixed << std::setprecision(3)
+              << (g_bsmMetric.rxBytes + g_authMetric.rxBytes) * 8.0 / (g_durationS * 1000.0)
+              << " kbps, total PDR="
+              << Pdr(g_bsmMetric.txPackets + g_authMetric.txPackets,
+                     g_bsmMetric.rxPackets + g_authMetric.rxPackets)
+              << " %, auth E2E mean/p95=" << authDelay.mean << '/' << authDelay.p95
+              << " ms, authentication completion mean/p95=" << completionDelay.mean << '/'
+              << completionDelay.p95 << " ms, completed=" << completed << '/' << eligible
+              << std::endl;
+
+    Simulator::Destroy();
+    return 0;
+}
