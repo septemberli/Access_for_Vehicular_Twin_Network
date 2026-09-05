@@ -1,391 +1,409 @@
 
-theory Proposed_RSU_TA_Authentication
+theory Proposed_Vehicle_Access
 begin
 
 builtins: diffie-hellman, symmetric-encryption
-functions: h1/1, h2/1, mac/2, mask/2, unmask/2
-equations: unmask(mask(m,k),k) = m
 
-/* ---------------- Initialization and registration ---------------- */
+functions:
+  h1/1,
+  h2/1,
+  mask/2,
+  unmask/2,
+  cheb_eval/2
+
+equations:
+  unmask(mask(m,k),k) = m
+
+
+/* ------------------------------------------------------------------------- */
+/* Initialization, registration, and the compositional RSU--TA assumption.  */
+/* ------------------------------------------------------------------------- */
 
 rule Init_TA:
   [ Fr(~skT) ]
   --[ InitTA(~skT) ]->
-  [ !TAKey(~skT), !TAPub('g'^~skT), Out('g'^~skT) ]
+  [ !TAKey(~skT)
+  , !TAPub('g'^~skT)
+  , Out('g'^~skT)
+  ]
 
 restriction One_TA:
   "All x y #i #j. InitTA(x)@i & InitTA(y)@j ==> #i = #j"
 
-#ifdef RTA
-rule Register_R:
-  let sR = h1(<skT,~R,~rhoR>)
-  in
-  [ !TAKey(skT), Fr(~R), Fr(~rhoR) ]
-  --[ RegR(~R,sR) ]->
-  [ !RLong(~R,sR), !TAR(~R,sR), !RName(~R), Out(~R) ]
-#endif
-
-#ifdef ACCESS
-rule Register_V:
-  let sV = h1(<skT,~V,~rhoV>)
+rule Register_Vehicle:
+  let sV = h1(<'VEHICLE-LONG-TERM',skT,~V,~rhoV>)
   in
   [ !TAKey(skT), Fr(~V), Fr(~rhoV) ]
-  --[ RegV(~V,sV) ]->
-  [ !VLong(~V,sV), !TAV(~V,sV) ]
-#endif
-
-/* ---------------- Repaired RSU <-> TA phase: M1..M3 ---------------- */
-
-#ifdef RTA
-/* Atomic check-and-insert invariant for TA's replay cache. */
-restriction Replay_Cache:
-  "All req #i #j. CacheConsume(req)@i & CacheConsume(req)@j ==> #i = #j"
-
-rule R_M1:
-  let B1 = 'g'^~b
-      B2 = pkT^~b
-      E1 = mask(R,h1(<B2,~t1>))
-      s1 = h2(<sR,B1,~t1,R>)
-      s2 = mac(<B1,~t1,R>,sR)
-      req = h1(<'RSU_AUTH_REQ',R,B1,E1,s2,~t1>)
-      M1 = <'M1',req,B1,E1,s2,~t1>
-  in
-  [ !RLong(R,sR), !TAPub(pkT), Fr(~b), Fr(~t1) ]
-  --[ RStart(R,req,B1,~t1) ]->
-  [ RAuthWait(R,sR,~b,B1,s1,req,M1), Out(M1) ]
-
-rule TA_M2_First:
-  let E1 = mask(R,h1(<B1^skT,t1>))
-      s1 = h2(<sR,B1,t1,R>)
-      s2 = mac(<B1,t1,R>,sR)
-      req = h1(<'RSU_AUTH_REQ',R,B1,E1,s2,t1>)
-      M1 = <'M1',req,B1,E1,s2,t1>
-      CT = 'g'^~d
-      kval = B1^~d
-      tidR = h1(<kval,R,req,~t2>)
-      skTJ = h1(<kval,sR,tidR,req>)
-      st2 = mac(<'M2',CT,tidR,s1,req,~t2>,skTJ)
-      M2 = <'M2',req,CT,st2,~t2>
-  in
-  [ !TAKey(skT), !TAR(R,sR), In(M1), Fr(~d), Fr(~t2) ]
-  --[ CacheConsume(req)
-    , TAAcceptR(R,req,B1,t1)
-    , TASendR(R,req,tidR,skTJ,B1,~t2)
-    , RTKey(R,req,tidR,skTJ)
-    ]->
-  [ TAAuthWait(R,req,tidR,skTJ,B1)
-  , !CachedM2(req,M1,M2)
-  , Out(M2)
+  --[ RegisterVehicle(~V,sV) ]->
+  [ !VLong(~V,sV)
+  , !TAVehicle(~V,sV)
   ]
 
-/* An exact duplicate gets the exact cached M2.  No new session is created. */
-rule TA_M2_Replay_Cached:
-  [ !CachedM2(req,M1,M2), In(M1) ]
-  --[ CachedReplay(req) ]->
-  [ Out(M2) ]
-
-rule R_M3:
-  let kval = CT^b
-      tidR = h1(<kval,R,req,t2>)
-      skTJ = h1(<kval,sR,tidR,req>)
-      st2 = mac(<'M2',CT,tidR,s1,req,t2>,skTJ)
-      conf = mac(<'M3',req,tidR,~t3>,skTJ)
-  in
-  [ RAuthWait(R,sR,b,B1,s1,req,M1)
-  , In(<'M2',req,CT,st2,t2>), Fr(~t3) ]
-  --[ RAcceptTA(R,req,tidR,skTJ,B1,t2)
-    , RTKey(R,req,tidR,skTJ)
-    ]->
-  [ !RActive(R,req,tidR,skTJ)
-  , Out(<'M3',req,tidR,conf,~t3>)
+/*
+ * This rule is the only assumption imported from the preceding RSU--TA
+ * enrollment phase.  R and tidR are public; skTJ is shared only by R and TA.
+ */
+rule Assume_Secure_RSU_TA_Channel:
+  [ Fr(~R), Fr(~tidR), Fr(~skTJ) ]
+  --[ AssumedSecureChannel(~R,~tidR,~skTJ) ]->
+  [ !PublicRSU(~R)
+  , !RChannel(~R,~tidR,~skTJ)
+  , !TAChannel(~R,~tidR,~skTJ)
+  , Out(~R)
+  , Out(~tidR)
   ]
 
-rule TA_M3_Finish:
-  [ TAAuthWait(R,req,tidR,skTJ,B1)
-  , In(<'M3',req,tidR,mac(<'M3',req,tidR,t3>,skTJ),t3>) ]
-  --[ TAFinishR(R,req,tidR,skTJ,B1) ]->
-  [ !TAActiveR(R,req,tidR,skTJ) ]
-#endif
-
-#ifdef ACCESS
-/* Compositional interface: an arbitrary fresh authenticated and secret
- * channel.  Its explicit reveal rule below gives the adversary exactly the
- * compromise capability used by the vehicle-phase lemmas. */
-rule Establish_Access_Channel:
-  [ Fr(~R0), Fr(~req0), Fr(~tidR0), Fr(~skTJ0) ]
-  --[ EstablishedAccessChannel(~R0,~req0,~tidR0,~skTJ0) ]->
-  [ !AccessRActive(~R0,~req0,~tidR0,~skTJ0)
-  , !AccessTAActive(~R0,~req0,~tidR0,~skTJ0)
-  , !RName(~R0)
-  , Out(~R0)
+/* The route is provisioned to the honest vehicle before access starts. */
+rule Provision_Route:
+  [ !VLong(V,sV), !PublicRSU(R), Fr(~nextR) ]
+  --[ RouteProvisioned(V,R,~nextR) ]->
+  [ !Route(V,R,~nextR)
+  , Out(~nextR)
   ]
 
-/* ---------------- Repaired vehicle access phase: M4..ACK ---------------- */
 
-rule V_M4:
-  let A1 = 'g'^~a
-      A2 = pkT^~a
-      E2 = mask(<V,R,'next_rsu'>,h1(<A2,~t4>))
-      si1 = h2(<A2,E2,sV,~t4>)
-      si2 = mac(<A2,E2,~t4>,sV)
+/* ------------------------------------------------------------------------- */
+/* M4: Vehicle -> RSU.                                                       */
+/* ------------------------------------------------------------------------- */
+
+rule V_Send_M4:
+  let A1     = 'g'^~a
+      A2     = pkT^~a
+      E2     = mask(<V,R,nextR>,h1(<A2,~t4>))
+      sigma1 = h2(<A2,E2,sV,~t4>)
+      sigma2 = cheb_eval(A2,sigma1)
+      M4     = <'M4',A1,E2,sigma2,~t4>
+      sid    = h1(<'ACCESS',A1,E2,~t4>)
   in
-  [ !VLong(V,sV), !TAPub(pkT), !RName(R), Fr(~a), Fr(~t4) ]
-  --[ VStart(V,R,A1,~t4) ]->
-  [ VAccessWait(V,R,sV,~a,A1,A2,E2,si1,~t4)
-  , Out(<'M4',A1,E2,si2,~t4>)
+  [ !VLong(V,sV)
+  , !TAPub(pkT)
+  , !Route(V,R,nextR)
+  , Fr(~a)
+  , Fr(~t4)
+  ]
+  --[ VStart(V,R,sid,A1,E2,~t4) ]->
+  [ VWaitM7(V,R,nextR,sV,~a,A1,A2,E2,~t4,sid)
+  , Out(M4)
   ]
 
-rule R_M5:
-  let M4 = <'M4',A1,E2,si2,t4>
-      RJ = 'g'^~eR
-      mu = mac(<tidR,RJ,M4,~t5>,skTJ)
+
+/* ------------------------------------------------------------------------- */
+/* M5: RSU -> TA.  The RSU authenticates the forwarded request to the TA.   */
+/* ------------------------------------------------------------------------- */
+
+rule R_Forward_M5:
+  let M4  = <'M4',A1,E2,sigma2,t4>
+      sid = h1(<'ACCESS',A1,E2,t4>)
+      RJ  = 'g'^~er
+      mu  = h1(<skTJ,sid,tidR,RJ,M4,~t5>)
+      M5  = <'M5',sid,tidR,RJ,mu,M4,~t5>
   in
-  [ !AccessRActive(R,req,tidR,skTJ), In(M4), Fr(~eR), Fr(~t5) ]
-  --[ RForward(R,req,tidR,RJ,M4,~t5) ]->
-  [ RAccessWait(R,req,tidR,skTJ,~eR,RJ,A1,E2,si2,t4,~t5)
-  , Out(<'M5',tidR,RJ,mu,M4,~t5>)
+  [ !RChannel(R,tidR,skTJ)
+  , In(M4)
+  , Fr(~er)
+  , Fr(~t5)
+  ]
+  --[ RForward(R,tidR,sid,RJ,M4,~t5) ]->
+  [ RWaitM6(R,tidR,skTJ,~er,RJ,A1,E2,sigma2,t4,sid,M4,~t5)
+  , Out(M5)
   ]
 
-rule TA_M6:
-  let A2 = A1^skT
-      E2 = mask(<V,R,'next_rsu'>,h1(<A2,t4>))
-      si2 = mac(<A2,E2,t4>,sV)
-      M4 = <'M4',A1,E2,si2,t4>
-      mu = mac(<tidR,RJ,M4,t5>,skTJ)
-      sVn = h1(<A2,sV,~t6>)
-      tidV = h1(<V,R,sVn>)
-      st4 = mac(<RJ,tidV,~t6>,sVn)
-      tidRn = h1(<skTJ,tidR,~t6>)
-      n1 = h2(<skTJ,mu,tidRn>)
-      ciph = senc(<'AEAD_payload',n1,tidV,st4>,skTJ)
-  in
-  [ !TAKey(skT), !TAV(V,sV), !AccessTAActive(R,req,tidR,skTJ)
-  , In(<'M5',tidR,RJ,mu,M4,t5>), Fr(~t6) ]
-  --[ TAAcceptForward(R,req,tidR,RJ,M4,t5)
-    , TAAcceptV(V,R,A1,RJ,tidV,t4)
-    , TASendM6(V,R,tidV,RJ,st4,~t6)
-    , TANextSecret(V,sVn,tidV)
-    ]->
-  [ Out(<'M6',ciph,~t6>) ]
 
-rule R_M7:
-  let M4 = <'M4',A1,E2,si2,t4>
-      mu = mac(<tidR,RJ,M4,t5>,skTJ)
-      tidRn = h1(<skTJ,tidR,t6>)
-      n1 = h2(<skTJ,mu,tidRn>)
-      ciph = senc(<'AEAD_payload',n1,tidV,st4>,skTJ)
-      K = A1^eR
-      tk = h1(<K,R,tidV>)
-      m2 = mac(<st4,t6,~t7>,tk)
+/* ------------------------------------------------------------------------- */
+/* M6: TA -> RSU.  Pattern matching performs all M4 and M5 checks.           */
+/* ------------------------------------------------------------------------- */
+
+rule TA_Send_M6:
+  let A2       = A1^skT
+      E2       = mask(<V,R,nextR>,h1(<A2,t4>))
+      sigma1   = h2(<A2,E2,sV,t4>)
+      sigma2   = cheb_eval(A2,sigma1)
+      M4       = <'M4',A1,E2,sigma2,t4>
+      sid      = h1(<'ACCESS',A1,E2,t4>)
+      mu       = h1(<skTJ,sid,tidR,RJ,M4,t5>)
+      sVn      = h1(<'NEXT-VEHICLE-SECRET',sid,A2,sV,~t6>)
+      tidV     = h1(<'VEHICLE-PSEUDONYM',sid,V,R,sVn>)
+      sigmaT3  = h2(<sid,sVn,tidV,RJ,~t6>)
+      sigmaT4  = cheb_eval(RJ,sigmaT3)
+      tidRn    = h1(<'NEXT-RSU-PSEUDONYM',sid,skTJ,tidR,~t6>)
+      nonce1   = h2(<'M6-NONCE',sid,skTJ,mu,tidRn>)
+      ad       = <'M6-AD',sid,tidR,RJ,~t6>
+      ciph     = senc(<ad,nonce1,tidV,sigmaT4>,skTJ)
+      M6       = <'M6',sid,ciph,~t6>
   in
-  [ RAccessWait(R,req,tidR,skTJ,eR,RJ,A1,E2,si2,t4,t5)
-  , In(<'M6',ciph,t6>), Fr(~t7) ]
-  --[ RSendM7(R,tidV,tk,A1,RJ,t6,~t7)
-    , RRunningV(R,tidV,tk,A1,RJ,st4,t6,~t7)
-    , V2RKey(R,tidV,tk)
+  [ !TAKey(skT)
+  , !TAVehicle(V,sV)
+  , !TAChannel(R,tidR,skTJ)
+  , In(<'M5',sid,tidR,RJ,mu,M4,t5>)
+  , Fr(~t6)
+  ]
+  --[ ConsumeAccessSid(sid)
+    , TAAcceptForward(R,tidR,sid,RJ,M4,t5)
+    , TAAcceptVehicle(V,R,sid,A1,RJ,tidV,t4)
+    , TASendM6(V,R,tidR,sid,tidV,RJ,sigmaT4,~t6)
     ]->
-  [ RConfirm(R,req,tidR,skTJ,tidV,tk,A1,RJ,st4,t6,~t7)
-  , !V2RActive(R,tidV,tk)
-  , Out(<'M7',RJ,m2,t6,~t7>)
+  [ TAPendingAck(V,R,tidR,skTJ,sid,tidV,sV,sVn,RJ)
+  , Out(M6)
   ]
 
-rule V_M8:
-  let sVn = h1(<A2,sV,t6>)
-      tidV = h1(<V,R,sVn>)
-      st4 = mac(<RJ,tidV,t6>,sVn)
-      K = RJ^a
-      tk = h1(<K,R,tidV>)
-      m2 = mac(<st4,t6,t7>,tk)
-      m3 = mac(<tidV,~t8>,tk)
+/* Implements the protocol's "reject a duplicate sid" requirement. */
+restriction Consume_Access_Sid_Once:
+  "All sid #i #j.
+     ConsumeAccessSid(sid)@i & ConsumeAccessSid(sid)@j
+     ==> #i = #j"
+
+
+/* ------------------------------------------------------------------------- */
+/* M7: RSU -> Vehicle.  AEAD verification binds M6 to M5 and this session.   */
+/* ------------------------------------------------------------------------- */
+
+rule R_Send_M7:
+  let tidRn   = h1(<'NEXT-RSU-PSEUDONYM',sid,skTJ,tidR,t6>)
+      mu      = h1(<skTJ,sid,tidR,RJ,M4,t5>)
+      nonce1  = h2(<'M6-NONCE',sid,skTJ,mu,tidRn>)
+      ad      = <'M6-AD',sid,tidR,RJ,t6>
+      ciph    = senc(<ad,nonce1,tidV,sigmaT4>,skTJ)
+      K       = A1^er
+      tk      = h1(<'ACCESS-KEY',sid,K,R,tidV>)
+      mac2    = h1(<'MAC2',tk,sid,sigmaT4,t6,~t7>)
+      M7      = <'M7',sid,RJ,mac2,t6,~t7>
   in
-  [ VAccessWait(V,R,sV,a,A1,A2,E2,si1,t4)
-  , In(<'M7',RJ,m2,t6,t7>), Fr(~t8) ]
-  --[ VAcceptR(V,R,tidV,tk,A1,RJ)
-    , VCommitPeers(V,R,tidV,tk,A1,RJ,st4,t6,t7,~t8)
-    , VUpdated(V,sV,sVn,tidV)
-    , V2RKey(R,tidV,tk)
+  [ RWaitM6(R,tidR,skTJ,er,RJ,A1,E2,sigma2,t4,sid,M4,t5)
+  , In(<'M6',sid,ciph,t6>)
+  , Fr(~t7)
+  ]
+  --[ RRunningVehicle(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,~t7)
+    , RSendM7(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,~t7)
     ]->
-  [ Out(<'M8',tidV,m3,~t8>) ]
+  [ RWaitM8(R,tidR,skTJ,tidV,sid,tk,A1,RJ,sigmaT4,t6,~t7)
+  , Out(M7)
+  ]
 
-rule R_ACK:
-  let m3 = mac(<tidV,t8>,tk)
-      ack = mac(<tidV,t8>,skTJ)
+
+/* ------------------------------------------------------------------------- */
+/* M8: Vehicle -> RSU.                                                       */
+/* ------------------------------------------------------------------------- */
+
+rule V_Send_M8:
+  let sVn      = h1(<'NEXT-VEHICLE-SECRET',sid,A2,sV,t6>)
+      tidV     = h1(<'VEHICLE-PSEUDONYM',sid,V,R,sVn>)
+      sigmaT3  = h2(<sid,sVn,tidV,RJ,t6>)
+      sigmaT4  = cheb_eval(RJ,sigmaT3)
+      K        = RJ^a
+      tk       = h1(<'ACCESS-KEY',sid,K,R,tidV>)
+      mac2     = h1(<'MAC2',tk,sid,sigmaT4,t6,t7>)
+      mac3     = h1(<'MAC3',tk,sid,tidV,~t8>)
+      M7       = <'M7',sid,RJ,mac2,t6,t7>
+      M8       = <'M8',sid,mac3,~t8>
   in
-  [ RConfirm(R,req,tidR,skTJ,tidV,tk,A1,RJ,st4,t6,t7)
-  , In(<'M8',tidV,m3,t8>) ]
-  --[ RAcceptV(R,tidV,tk,A1,RJ)
-    , RCommitV(R,tidV,tk,A1,RJ,st4,t6,t7,t8)
-    , RSendAck(R,tidV,t8)
-    , CompleteRun(R,req,tidR,tidV,tk,A1,RJ)
+  [ VWaitM7(V,R,nextR,sV,a,A1,A2,E2,t4,sid)
+  , In(M7)
+  , Fr(~t8)
+  ]
+  --[ VAcceptRSUAndTA(V,R,tidV,sid,tk,A1,RJ)
+    , VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,~t8)
     ]->
-  [ Out(<'ACK',req,tidR,tidV,ack,t8>) ]
+  [ VAccessAccepted(V,R,tidV,sid,tk,sV,sVn)
+  , Out(M8)
+  ]
 
-rule TA_ACK:
-  [ !AccessTAActive(R,req,tidR,skTJ)
-  , In(<'ACK',req,tidR,tidV,mac(<tidV,t8>,skTJ),t8>) ]
-  --[ TAReceivedAck(R,req,tidV,t8) ]->
-  []
-#endif
 
-/* ---------------- Explicit compromise capabilities ---------------- */
+/* ------------------------------------------------------------------------- */
+/* ACK: RSU confirms M8 to the TA.                                           */
+/* ------------------------------------------------------------------------- */
 
-#ifdef RTA
-rule Reveal_R_Long:
-  [ !RLong(R,sR) ] --[ RevealR(R,sR) ]-> [ Out(<R,sR>) ]
-#endif
+rule R_Send_ACK:
+  let mac3 = h1(<'MAC3',tk,sid,tidV,t8>)
+      ack  = h1(<'ACCESS-ACK',skTJ,sid,tidV,t8,~t9>)
+      M8   = <'M8',sid,mac3,t8>
+      ACK  = <'ACK',sid,ack,t8,~t9>
+  in
+  [ RWaitM8(R,tidR,skTJ,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7)
+  , In(M8)
+  , Fr(~t9)
+  ]
+  --[ RAcceptVehicle(R,tidV,sid,tk,A1,RJ,t8)
+    , RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)
+    , AccessKeyEstablished(R,tidV,sid,tk)
+    ]->
+  [ !EstablishedAccessKey(R,tidV,sid,tk)
+  , Out(ACK)
+  ]
 
-#ifdef ACCESS
-rule Reveal_V_Long:
-  [ !VLong(V,sV) ] --[ RevealV(V,sV) ]-> [ Out(<V,sV>) ]
-#endif
+rule TA_Receive_ACK:
+  let ack = h1(<'ACCESS-ACK',skTJ,sid,tidV,t8,t9>)
+  in
+  [ TAPendingAck(V,R,tidR,skTJ,sid,tidV,sV,sVn,RJ)
+  , In(<'ACK',sid,ack,t8,t9>)
+  ]
+  --[ TAFinishAccess(V,R,tidV,sid,RJ,t8,t9) ]->
+  [ ]
 
-rule Reveal_TA:
-  [ !TAKey(skT) ] --[ RevealTA(skT) ]-> [ Out(skT) ]
 
-#ifdef RTA
-rule Reveal_RT_Session:
-  [ !RActive(R,req,tidR,skTJ) ]
-  --[ RevealRT(R,req,tidR,skTJ) ]->
-  [ Out(skTJ) ]
-#endif
+/* ------------------------------------------------------------------------- */
+/* Explicit compromise capabilities.                                        */
+/* ------------------------------------------------------------------------- */
 
-#ifdef ACCESS
-rule Reveal_Access_Channel:
-  [ !AccessRActive(R,req,tidR,skTJ) ]
-  --[ RevealAccess(R,req,tidR,skTJ) ]->
-  [ Out(<R,req,tidR,skTJ>) ]
+rule Reveal_Vehicle_Long_Term:
+  [ !VLong(V,sV) ]
+  --[ RevealVehicle(V,sV) ]->
+  [ Out(<V,sV>) ]
 
-rule Reveal_V2R_Session:
-  [ !V2RActive(R,tidV,tk) ]
-  --[ RevealV2R(R,tidV,tk) ]->
+/* Models compromise of the TA's per-vehicle database record. */
+rule Reveal_TA_Vehicle_Record:
+  [ !TAVehicle(V,sV) ]
+  --[ RevealTARecord(V,sV) ]->
+  [ Out(<V,sV>) ]
+
+rule Reveal_RSU_TA_Channel:
+  [ !RChannel(R,tidR,skTJ) ]
+  --[ RevealChannel(R,tidR,skTJ) ]->
+  [ Out(<R,tidR,skTJ>) ]
+
+rule Reveal_TA_Master_Key:
+  [ !TAKey(skT) ]
+  --[ RevealTAKey(skT) ]->
+  [ Out(skT) ]
+
+rule Reveal_Access_Session_Key:
+  [ !EstablishedAccessKey(R,tidV,sid,tk) ]
+  --[ RevealAccessKey(R,tidV,sid,tk) ]->
   [ Out(tk) ]
-#endif
 
-/* ---------------- Executability ---------------- */
 
-#ifdef RTA
-lemma executable_r_ta:
+/* ------------------------------------------------------------------------- */
+/* Executability.                                                            */
+/* ------------------------------------------------------------------------- */
+
+lemma executable_access:
   exists-trace
-  "Ex R req tidR skTJ B1 #i. TAFinishR(R,req,tidR,skTJ,B1)@i"
-#endif
+  "Ex R tidV sid tk A1 RJ sigmaT4 t6 t7 t8 #i.
+     RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i"
 
-#ifdef ACCESS
-lemma executable_vehicle_access:
+lemma executable_access_with_ta_ack:
   exists-trace
-  "Ex R req tidR tidV tk A1 RJ #i.
-     CompleteRun(R,req,tidR,tidV,tk,A1,RJ)@i"
-#endif
+  "Ex V R tidV sid RJ t8 t9 #i.
+     TAFinishAccess(V,R,tidV,sid,RJ,t8,t9)@i"
 
-/* ---------------- RSU <-> TA authentication properties ---------------- */
 
-#ifdef RTA
-lemma ta_authenticates_r:
-  "All R req B1 t1 #i. TAAcceptR(R,req,B1,t1)@i
-   ==> (Ex #j. RStart(R,req,B1,t1)@j & #j < #i)
-     | (Ex sR #r. RevealR(R,sR)@r)"
+/* ------------------------------------------------------------------------- */
+/* Authentication and agreement.                                            */
+/* ------------------------------------------------------------------------- */
 
-lemma r_authenticates_ta:
-  "All R req tidR skTJ B1 t2 #i. RAcceptTA(R,req,tidR,skTJ,B1,t2)@i
-   ==> (Ex #j. TASendR(R,req,tidR,skTJ,B1,t2)@j & #j < #i)
-     | (Ex skT #r. RevealTA(skT)@r)
-     | (Ex sR #r. RevealR(R,sR)@r)"
-
-lemma ta_key_confirmation:
-  "All R req tidR skTJ B1 #i. TAFinishR(R,req,tidR,skTJ,B1)@i
-   ==> (Ex t2 #j. RAcceptTA(R,req,tidR,skTJ,B1,t2)@j & #j < #i)
-     | (Ex #r. RevealRT(R,req,tidR,skTJ)@r)
-     | (Ex sR #r. RevealR(R,sR)@r)"
-
-lemma ta_r_injective_agreement:
-  "All R req B1 t1 #i. TAAcceptR(R,req,B1,t1)@i
-   ==> ((Ex #j. RStart(R,req,B1,t1)@j & #j < #i)
-        & (All #i2. TAAcceptR(R,req,B1,t1)@i2 ==> #i2 = #i))
-     | (Ex sR #r. RevealR(R,sR)@r)"
-
-lemma r_ta_injective_agreement:
-  "All R req tidR skTJ B1 t2 #i. RAcceptTA(R,req,tidR,skTJ,B1,t2)@i
-   ==> ((Ex #j. TASendR(R,req,tidR,skTJ,B1,t2)@j & #j < #i)
-        & (All #i2. RAcceptTA(R,req,tidR,skTJ,B1,t2)@i2 ==> #i2 = #i))
-     | (Ex skT #r. RevealTA(skT)@r)
-     | (Ex sR #r. RevealR(R,sR)@r)"
-
-lemma ta_r_injective_key_confirmation:
-  "All R req tidR skTJ B1 #i. TAFinishR(R,req,tidR,skTJ,B1)@i
-   ==> ((Ex t2 #j. RAcceptTA(R,req,tidR,skTJ,B1,t2)@j & #j < #i)
-        & (All #i2. TAFinishR(R,req,tidR,skTJ,B1)@i2 ==> #i2 = #i))
-     | (Ex #r. RevealRT(R,req,tidR,skTJ)@r)
-     | (Ex sR #r. RevealR(R,sR)@r)"
-
-lemma r_ta_session_key_secrecy:
-  "All R req tidR skTJ #i #j. RTKey(R,req,tidR,skTJ)@i & K(skTJ)@j
-   ==> (Ex #r. RevealRT(R,req,tidR,skTJ)@r)
-     | (Ex sR #r. RevealR(R,sR)@r & #r < #i)"
-#endif
-
-/* ---------------- Vehicle-access authentication properties ---------------- */
-
-#ifdef ACCESS
-lemma ta_authenticates_r_forward:
-  "All R req tidR RJ M4 t5 #i. TAAcceptForward(R,req,tidR,RJ,M4,t5)@i
-   ==> (Ex #j. RForward(R,req,tidR,RJ,M4,t5)@j & #j < #i)
-     | (Ex sk #r. RevealAccess(R,req,tidR,sk)@r)"
+lemma ta_authenticates_rsu_forward:
+  "All R tidR sid RJ M4 t5 #i.
+     TAAcceptForward(R,tidR,sid,RJ,M4,t5)@i
+   ==> (Ex #j. RForward(R,tidR,sid,RJ,M4,t5)@j & #j < #i)
+     | (Ex sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)"
 
 lemma ta_authenticates_vehicle:
-  "All V R A1 RJ tidV t4 #i. TAAcceptV(V,R,A1,RJ,tidV,t4)@i
-   ==> (Ex #j. VStart(V,R,A1,t4)@j & #j < #i)
-     | (Ex sV #r. RevealV(V,sV)@r)"
+  "All V R sid A1 RJ tidV t4 #i.
+     TAAcceptVehicle(V,R,sid,A1,RJ,tidV,t4)@i
+   ==> (Ex E2 #j. VStart(V,R,sid,A1,E2,t4)@j & #j < #i)
+     | (Ex sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex sV #r. RevealTARecord(V,sV)@r & #r < #i)"
 
-lemma vehicle_authenticates_r_and_ta:
-  "All V R tidV tk A1 RJ #i. VAcceptR(V,R,tidV,tk,A1,RJ)@i
-   ==> ((Ex st4 t6 #j. TASendM6(V,R,tidV,RJ,st4,t6)@j & #j < #i)
-     & (Ex t6 t7 #k. RSendM7(R,tidV,tk,A1,RJ,t6,t7)@k & #k < #i))
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r)
-     | (Ex sV #r. RevealV(V,sV)@r)"
+lemma vehicle_authenticates_rsu_and_ta:
+  "All V R tidV sid tk A1 RJ #i.
+     VAcceptRSUAndTA(V,R,tidV,sid,tk,A1,RJ)@i
+   ==> ((Ex tidR sigmaT4 t6 #j.
+           TASendM6(V,R,tidR,sid,tidV,RJ,sigmaT4,t6)@j & #j < #i)
+        & (Ex sigmaT4 t6 t7 #k.
+           RSendM7(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7)@k & #k < #i))
+     | (Ex sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)
+     | (Ex sV skT #r1 #r2.
+          RevealTARecord(V,sV)@r1 & RevealTAKey(skT)@r2
+          & #r1 < #i & #r2 < #i)"
 
-lemma r_authenticates_vehicle_key_confirmation:
-  "All R tidV tk A1 RJ #i. RAcceptV(R,tidV,tk,A1,RJ)@i
-   ==> (Ex V #j. VAcceptR(V,R,tidV,tk,A1,RJ)@j & #j < #i)
-     | (Ex V sV #r. RevealV(V,sV)@r)
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r)
-     | (Ex #r. RevealV2R(R,tidV,tk)@r)"
+lemma rsu_authenticates_vehicle:
+  "All R tidV sid tk A1 RJ t8 #i.
+     RAcceptVehicle(R,tidV,sid,tk,A1,RJ,t8)@i
+   ==> (Ex V sigmaT4 t6 t7 #j.
+          VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@j
+          & #j < #i)
+     | (Ex V sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex V sV #r. RevealTARecord(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)
+     | (Ex #r. RevealAccessKey(R,tidV,sid,tk)@r & #r < #i)"
 
-lemma r_vehicle_injective_agreement:
-  "All R tidV tk A1 RJ st4 t6 t7 t8 #i.
-     RCommitV(R,tidV,tk,A1,RJ,st4,t6,t7,t8)@i
-   ==> ((Ex V #j. VCommitPeers(V,R,tidV,tk,A1,RJ,st4,t6,t7,t8)@j
-                    & #j < #i)
-        & (All #i2. RCommitV(R,tidV,tk,A1,RJ,st4,t6,t7,t8)@i2
-                     ==> #i2 = #i))
-     | (Ex V sV #r. RevealV(V,sV)@r)
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r)
-     | (Ex #r. RevealV2R(R,tidV,tk)@r)"
-
-lemma vehicle_r_injective_agreement:
-  "All V R tidV tk A1 RJ st4 t6 t7 t8 #i.
-     VCommitPeers(V,R,tidV,tk,A1,RJ,st4,t6,t7,t8)@i
-   ==> ((Ex #j. RRunningV(R,tidV,tk,A1,RJ,st4,t6,t7)@j & #j < #i)
+lemma vehicle_rsu_injective_agreement:
+  "All V R tidV sid tk A1 RJ sigmaT4 t6 t7 t8 #i.
+     VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i
+   ==> ((Ex #j.
+           RRunningVehicle(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7)@j
+           & #j < #i)
         & (All V2 t82 #i2.
-             VCommitPeers(V2,R,tidV,tk,A1,RJ,st4,t6,t7,t82)@i2
+             VCommitAccess(V2,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t82)@i2
              ==> #i2 = #i))
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r)
-     | (Ex sV #r. RevealV(V,sV)@r)"
+     | (Ex sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)
+     | (Ex sV skT #r1 #r2.
+          RevealTARecord(V,sV)@r1 & RevealTAKey(skT)@r2
+          & #r1 < #i & #r2 < #i)"
 
-lemma vehicle_ta_injective_agreement:
-  "All V R tidV tk A1 RJ st4 t6 t7 t8 #i.
-     VCommitPeers(V,R,tidV,tk,A1,RJ,st4,t6,t7,t8)@i
-   ==> ((Ex #j. TASendM6(V,R,tidV,RJ,st4,t6)@j & #j < #i)
-        & (All tk2 t72 t82 #i2.
-             VCommitPeers(V,R,tidV,tk2,A1,RJ,st4,t6,t72,t82)@i2
+lemma rsu_vehicle_injective_agreement:
+  "All R tidV sid tk A1 RJ sigmaT4 t6 t7 t8 #i.
+     RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i
+   ==> ((Ex V #j.
+           VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@j
+           & #j < #i)
+        & (All #i2.
+             RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i2
              ==> #i2 = #i))
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r)
-     | (Ex sV #r. RevealV(V,sV)@r)"
+     | (Ex V sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex V sV #r. RevealTARecord(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)
+     | (Ex #r. RevealAccessKey(R,tidV,sid,tk)@r & #r < #i)"
 
-lemma v2r_session_key_secrecy:
-  "All R tidV tk #i #j. V2RKey(R,tidV,tk)@i & K(tk)@j
-   ==> (Ex #r. RevealV2R(R,tidV,tk)@r)
-     | (Ex req tidR sk #r. RevealAccess(R,req,tidR,sk)@r & #r < #i)
-     | (Ex V sV #r. RevealV(V,sV)@r & #r < #i)"
-#endif
+lemma ta_ack_authenticates_rsu_completion:
+  "All V R tidV sid RJ t8 t9 #i.
+     TAFinishAccess(V,R,tidV,sid,RJ,t8,t9)@i
+   ==> (Ex tk A1 sigmaT4 t6 t7 #j.
+          RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@j
+          & #j < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)"
+
+
+/* ------------------------------------------------------------------------- */
+/* Key confirmation and secrecy.                                            */
+/* ------------------------------------------------------------------------- */
+
+lemma vehicle_key_confirmation:
+  "All V R tidV sid tk A1 RJ sigmaT4 t6 t7 t8 #i.
+     VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i
+   ==> (Ex #j.
+          RRunningVehicle(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7)@j
+          & #j < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)
+     | (Ex sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex sV skT #r1 #r2.
+          RevealTARecord(V,sV)@r1 & RevealTAKey(skT)@r2
+          & #r1 < #i & #r2 < #i)"
+
+lemma rsu_key_confirmation:
+  "All R tidV sid tk A1 RJ sigmaT4 t6 t7 t8 #i.
+     RCommitAccess(R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@i
+   ==> (Ex V #j.
+          VCommitAccess(V,R,tidV,sid,tk,A1,RJ,sigmaT4,t6,t7,t8)@j
+          & #j < #i)
+     | (Ex #r. RevealAccessKey(R,tidV,sid,tk)@r & #r < #i)
+     | (Ex V sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex V sV #r. RevealTARecord(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)"
+
+/*
+ * If an established access key becomes known, an explicit compromise must
+ * explain the disclosure.  Long-term compromises are only accepted as an
+ * explanation when they happened before the completed access session; thus a
+ * later long-term compromise alone must not reveal an old access key (PFS).
+ */
+lemma access_session_key_secrecy_and_pfs:
+  "All R tidV sid tk #i #j.
+     AccessKeyEstablished(R,tidV,sid,tk)@i & K(tk)@j
+   ==> (Ex #r. RevealAccessKey(R,tidV,sid,tk)@r)
+     | (Ex V sV #r. RevealVehicle(V,sV)@r & #r < #i)
+     | (Ex V sV #r. RevealTARecord(V,sV)@r & #r < #i)
+     | (Ex tidR sk #r. RevealChannel(R,tidR,sk)@r & #r < #i)"
 
 end
-
